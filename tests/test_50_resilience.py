@@ -28,7 +28,8 @@ class Resilience(lib.Base):
         lib.cleanup()
         self.srv = lib.Server().start()
         self.g = lib.Gadget(0).create()
-        self.assertEqual(lib.bind(self.g.busid).returncode, 0)
+        r = lib.bind(self.g.busid)
+        self.assertEqual(r.returncode, 0, f"bind {self.g.busid}: {r.stderr.strip()} (vhci ports in use: {lib.vhci_used_ports()})")
 
     def tearDown(self):
         self.srv.kill(15)

@@ -42,10 +42,15 @@ PAD_DESC = bytes([
     0x05, 0x01, 0x09, 0x30, 0x09, 0x31, 0x09, 0x32, 0x09, 0x35, 0x15, 0x00, 0x26, 0xFF, 0x00,
     0x75, 0x08, 0x95, 0x04, 0x81, 0x02,
     0xC0])
-PROFILES = {"probe": (PROBE_DESC, 16), "pad": (PAD_DESC, 6), "loop": (None, 0)}  # loop: bulk echo, no minor limit
-FUNC = {"probe": "hid.usb0", "pad": "hid.usb0", "loop": "Loopback.usb0"}
-
-
+PUCK_DESC = bytes([  # one vendor-defined 64-byte slot, like each controller interface on the Steam puck
+    0x06, 0x00, 0xFF, 0x09, 0x01, 0xA1, 0x01,
+    0x09, 0x02, 0x15, 0x00, 0x26, 0xFF, 0x00, 0x75, 0x08, 0x95, 0x40, 0x81, 0x02,
+    0x09, 0x03, 0x95, 0x40, 0x91, 0x02,
+    0xC0])
+# (descriptor, endpoint packet size). A report that exactly fills the endpoint packet makes f_hid follow it with a
+# zero-length packet, and every other interrupt URB then returns empty (halving the delivered rate). Real devices avoid
+# this (puck: 54-byte reports on a 64-byte endpoint), so the probe's 16-byte reports ride a 32-byte endpoint.
+PROFILES = {"probe": (PROBE_DESC, 32), "pad": (PAD_DESC, 16)}
 STOCK = USBIPD == ["usbipd"]
 
 
@@ -99,17 +104,39 @@ def setup_modules(vhci_controllers=None):
 
 
 class Gadget:
-    """One emulated controller on dummy_udc.<idx>."""
+    """One emulated device on dummy_udc.<idx>.
+    probe / pad: one HID interface.  loop: bulk echo (no minor limit).
+    puck: serial (2 interfaces) + `slots` HID interfaces of 64 bytes, shaped like the Steam puck. f_hid has 4 minors
+          machine-wide, so slots across all live gadgets must total 4.
+    dongle: two vendor-class bulk interfaces (echo + source/sink), a rough stand-in for the Xbox dongle's USB side.
+          Isochronous endpoints (headset audio on the real one) can't be had from dummy_hcd with this function: untested."""
 
-    def __init__(self, idx, profile="probe", serial=None):
-        self.idx, self.profile = idx, profile
+    def __init__(self, idx, profile="probe", serial=None, slots=4):
+        self.idx, self.profile, self.slots = idx, profile, slots
         self.serial = serial or f"ufk{idx}"
         self.g = f"{CFG}/{self.serial}"
         self.busid = None
 
+    def functions(self):
+        """[(configfs function name, {attribute: value})] in interface order."""
+        if self.profile in PROFILES:
+            desc, rlen = PROFILES[self.profile]
+            return [("hid.usb0", {"protocol": "0", "subclass": "0", "report_length": str(rlen), "report_desc": desc})]
+        if self.profile == "loop":
+            return [("Loopback.usb0", {})]
+        if self.profile == "puck":
+            hid = {"protocol": "0", "subclass": "0", "report_length": "64", "report_desc": PUCK_DESC}
+            return [("acm.usb0", {})] + [(f"hid.usb{i}", dict(hid)) for i in range(self.slots)]
+        if self.profile == "dongle":
+            return [("Loopback.usb0", {}), ("SourceSink.usb0", {})]
+        raise ValueError(self.profile)
+
     def create(self):
-        desc, rlen = PROFILES[self.profile]
         g = self.g
+        # a gadget destroyed an instant ago can linger in sysfs under the same serial; wait it out or we latch onto
+        # its (soon to vanish) bus id
+        if not wait_for(lambda: not self._find_busid(), 8):
+            raise RuntimeError(f"previous {self.serial} never left the bus")
         os.makedirs(g)
         write(g + "/idVendor", hex(VID))
         write(g + "/idProduct", hex(PID))
@@ -120,14 +147,12 @@ class Gadget:
         write(g + "/strings/0x409/serialnumber", self.serial)
         os.makedirs(g + "/configs/c.1/strings/0x409")
         write(g + "/configs/c.1/strings/0x409/configuration", "cfg")
-        fn = f"{g}/functions/{FUNC[self.profile]}"
-        os.makedirs(fn)
-        if desc:
-            write(fn + "/protocol", "0")
-            write(fn + "/subclass", "0")
-            write(fn + "/report_length", str(rlen))
-            write(fn + "/report_desc", desc)
-        os.symlink(fn, f"{g}/configs/c.1/{FUNC[self.profile]}")
+        for name, attrs in self.functions():  # link order = interface order
+            fn = f"{g}/functions/{name}"
+            os.makedirs(fn)
+            for k, v in attrs.items():
+                write(f"{fn}/{k}", v)
+            os.symlink(fn, f"{g}/configs/c.1/{name}")
         write(g + "/UDC", f"dummy_udc.{self.idx}")
         self.busid = wait_for(self._find_busid, 8)
         if not self.busid:
@@ -144,26 +169,39 @@ class Gadget:
             except OSError:
                 pass
 
-    def hidg(self):
-        """Device-side node: write input reports here, read output reports."""
-        major, minor = map(int, read(self.g + "/functions/hid.usb0/dev").split(":"))  # f_hid has only 4 minors
+    def hidg(self, i=0):
+        """Device-side node of HID function i: write input reports here, read output reports."""
+        major, minor = map(int, read(f"{self.g}/functions/hid.usb{i}/dev").split(":"))
         for p in glob.glob("/dev/hidg*"):
             if os.stat(p).st_rdev == os.makedev(major, minor):
                 return p
         raise RuntimeError("no /dev/hidg node")
 
+    def tty(self):
+        """Device-side serial node of the acm function."""
+        return "/dev/ttyGS" + read(f"{self.g}/functions/acm.usb0/port_num")
+
     def destroy(self):
         g = self.g
         if not os.path.isdir(g):
             return
-        for step in (lambda: write(g + "/UDC", "\n"), lambda: os.unlink(f"{g}/configs/c.1/{FUNC[self.profile]}"),
-                     lambda: os.rmdir(g + "/configs/c.1/strings/0x409"), lambda: os.rmdir(g + "/configs/c.1"),
-                     lambda: os.rmdir(f"{g}/functions/{FUNC[self.profile]}"), lambda: os.rmdir(g + "/strings/0x409"),
-                     lambda: os.rmdir(g)):
+
+        def quietly(fn, *a):
             try:
-                step()
+                fn(*a)
             except OSError:
                 pass
+        quietly(write, g + "/UDC", "\n")
+        for l in glob.glob(g + "/configs/c.1/*"):
+            if os.path.islink(l):
+                quietly(os.unlink, l)
+        quietly(os.rmdir, g + "/configs/c.1/strings/0x409")
+        quietly(os.rmdir, g + "/configs/c.1")
+        for f in glob.glob(g + "/functions/*"):
+            quietly(os.rmdir, f)
+        quietly(os.rmdir, g + "/strings/0x409")
+        quietly(os.rmdir, g)
+        wait_for(lambda: not self._find_busid(), 8)  # removal from the bus is asynchronous
 
     def __enter__(self):
         return self.create()
@@ -174,8 +212,7 @@ class Gadget:
 
 def destroy_all_gadgets():
     for g in glob.glob(CFG + "/ufk*"):
-        prof = "loop" if os.path.isdir(g + "/functions/Loopback.usb0") else "probe"
-        Gadget(0, prof, serial=os.path.basename(g)).destroy()
+        Gadget(0, serial=os.path.basename(g)).destroy()
 
 
 def hidraw_of(busid):
@@ -183,6 +220,16 @@ def hidraw_of(busid):
     def find():
         p = glob.glob(f"{SYS_USB}/{busid}/{busid}:1.0/*/hidraw/hidraw*")
         return "/dev/" + os.path.basename(p[0]) if p else None
+    return wait_for(find, 8)
+
+
+def hidraws_of(busid, count):
+    """Host-side hidraw nodes of a multi-interface device, ordered by interface number."""
+    def find():
+        found = []
+        for p in glob.glob(f"{SYS_USB}/{busid}/{busid}:1.*/*/hidraw/hidraw*"):
+            found.append((int(re.search(r":1\.(\d+)/", p).group(1)), "/dev/" + os.path.basename(p)))
+        return [n for _, n in sorted(found)] if len(found) >= count else None
     return wait_for(find, 8)
 
 
@@ -261,11 +308,11 @@ def bind(busid):
     global BIND_RETRIES
     assert is_test_device(busid), f"refusing to bind non-test device {busid}"
     r = sh("usbip", "bind", "-b", busid, check=False)
-    for _ in range(15):
+    for _ in range(40):
         if r.returncode == 0:
             break
         BIND_RETRIES += 1
-        time.sleep(0.2)
+        time.sleep(0.25)
         r = sh("usbip", "bind", "-b", busid, check=False)
     return r
 
@@ -439,7 +486,7 @@ def get_descriptor_setup(dtype, index, length, iface=False, value_lang=0):
 
 # ---- report streaming, latency measurement -----------------------------------------------------------
 
-def _writer(hidg, n, hz, ready, idx):
+def _writer(hidg, n, hz, ready, idx, size):
     fd = os.open(hidg, os.O_WRONLY)
     ready.wait(15)
     time.sleep(0.3)  # let the reader's interrupt URBs reach the device
@@ -449,7 +496,7 @@ def _writer(hidg, n, hz, ready, idx):
         d = target - time.perf_counter()
         if d > 0:
             time.sleep(d)
-        os.write(fd, struct.pack("<IQI", i, time.monotonic_ns(), idx))
+        os.write(fd, struct.pack("<IQI", i, time.monotonic_ns(), idx).ljust(size, b"\0"))
     os.close(fd)
 
 
@@ -467,18 +514,18 @@ def _reader(hidraw, n, hz, ready, conn):
         t = time.monotonic_ns()
         if len(b) >= 16:
             seq, ts, _ = struct.unpack("<IQI", b[:16])
-            rows.append((seq, t - ts))
+            rows.append((seq, t - ts, t))
     os.close(fd)
     conn.send(rows)
 
 
-def stream(pairs, seconds, hz):
+def stream(pairs, seconds, hz, size=16):
     """Pace `hz` reports/s through every (hidg, hidraw) pair at once; return one stats dict per pair."""
     n, ctx, jobs = int(seconds * hz), mp.get_context("fork"), []
     for i, (hidg, hidraw) in enumerate(pairs):
         ready, (pc, cc) = ctx.Event(), ctx.Pipe(False)
         r = ctx.Process(target=_reader, args=(hidraw, n, hz, ready, cc))
-        w = ctx.Process(target=_writer, args=(hidg, n, hz, ready, i))
+        w = ctx.Process(target=_writer, args=(hidg, n, hz, ready, i, size))
         r.start()
         w.start()
         jobs.append((r, w, pc))
@@ -495,19 +542,23 @@ def stream(pairs, seconds, hz):
 
 
 def analyze(rows, sent):
-    seqs = [s for s, _ in rows]
+    seqs = [r[0] for r in rows]
     uniq = set(seqs)
-    lat = sorted(l / 1e6 for _, l in rows)
+    lat = sorted(r[1] / 1e6 for r in rows)
     q = lambda p: lat[min(len(lat) - 1, int(len(lat) * p))] if lat else float("nan")
-    return {"sent": sent, "got": len(rows), "lost": sent - len(uniq), "dup": len(seqs) - len(uniq),
-            "reorder": sum(1 for a, b in zip(seqs, seqs[1:]) if b < a),
-            "p50": q(.5), "p95": q(.95), "p99": q(.99), "max": lat[-1] if lat else float("nan"),
-            "mean": sum(lat) / len(lat) if lat else float("nan")}
+    out = {"sent": sent, "got": len(rows), "lost": sent - len(uniq), "dup": len(seqs) - len(uniq),
+           "reorder": sum(1 for a, b in zip(seqs, seqs[1:]) if b < a),
+           "p50": q(.5), "p95": q(.95), "p99": q(.99), "max": lat[-1] if lat else float("nan"),
+           "mean": sum(lat) / len(lat) if lat else float("nan")}
+    if len(rows) > 1 and len(rows[0]) > 2 and rows[-1][2] > rows[0][2]:
+        out["rate"] = (len(rows) - 1) / ((rows[-1][2] - rows[0][2]) / 1e9)  # delivered reports per second
+    return out
 
 
 def merge(stats):
-    """Worst case across devices."""
-    return {k: (max(s[k] for s in stats) if k not in ("sent", "got") else sum(s[k] for s in stats))
+    """Worst case across devices (lowest rate, highest everything else)."""
+    return {k: (min(s[k] for s in stats) if k == "rate" else
+                sum(s[k] for s in stats) if k in ("sent", "got") else max(s[k] for s in stats))
             for k in stats[0]}
 
 
@@ -606,7 +657,8 @@ def loop_stream(busids, seconds, hz):
 
 
 def fmt(s):
-    return f"p50={s['p50']:.2f} p99={s['p99']:.2f} max={s['max']:.2f}ms lost={s['lost']}/{s['sent']}"
+    r = f" rate={s['rate']:.0f}/s" if "rate" in s else ""
+    return f"p50={s['p50']:.2f} p99={s['p99']:.2f} max={s['max']:.2f}ms lost={s['lost']}/{s['sent']}{r}"
 
 
 fuzz_rng = random.Random(int(os.environ.get("FUZZ_SEED", "1")))
@@ -621,6 +673,60 @@ def cleanup():
         if ":" not in b and is_test_device(b):
             sh("usbip", "unbind", "-b", b, check=False)  # device may vanish mid-cleanup: no asserts here
     destroy_all_gadgets()
+
+
+class Link:
+    """The server in its own network namespace, joined to this one by a veth pair. shape() applies netem to both
+    directions of that pair only, so nothing else on the machine is affected."""
+    NS, HOST_IF, NS_IF, HOST_IP, NS_IP, NET = "ufk-srv", "ufk0", "ufk1", "10.99.0.1", "10.99.0.2", "10.99.0.0/24"
+
+    def __init__(self):
+        self.fw = None
+
+    def up(self):
+        import unittest
+        try:
+            sh("ip", "netns", "del", self.NS, check=False)
+            sh("ip", "netns", "add", self.NS)
+            sh("ip", "link", "add", self.HOST_IF, "type", "veth", "peer", "name", self.NS_IF)
+            sh("ip", "link", "set", self.NS_IF, "netns", self.NS)
+            sh("ip", "addr", "add", f"{self.HOST_IP}/24", "dev", self.HOST_IF)
+            sh("ip", "link", "set", self.HOST_IF, "up")
+            sh("ip", "-n", self.NS, "addr", "add", f"{self.NS_IP}/24", "dev", self.NS_IF)
+            sh("ip", "-n", self.NS, "link", "set", self.NS_IF, "up")
+            sh("ip", "-n", self.NS, "link", "set", "lo", "up")
+            sh("modprobe", "sch_netem")
+            # a host firewall (ufw) would drop traffic arriving on the new interface; allow just this one
+            if sh("which", "iptables", check=False).returncode == 0:
+                self.fw = ["iptables", "-I", "INPUT", "-i", self.HOST_IF, "-j", "ACCEPT"]
+                sh(*self.fw)
+            if os.environ.get("RTO_MIN_MS"):
+                self.rto(os.environ["RTO_MIN_MS"])
+            sh("ping", "-c", "1", "-W", "2", self.NS_IP)
+        except (subprocess.CalledProcessError, OSError) as e:
+            self.down()
+            raise unittest.SkipTest(f"cannot build the test network: {getattr(e, 'stderr', e)}")
+        return self
+
+    def rto(self, ms):
+        """Lower the TCP minimum retransmit timeout on both ends (the loss-stall experiment)."""
+        sh("ip", "route", "change", self.NET, "dev", self.HOST_IF, "rto_min", f"{ms}ms")
+        sh("ip", "-n", self.NS, "route", "change", self.NET, "dev", self.NS_IF, "rto_min", f"{ms}ms")
+
+    def shape(self, spec):
+        """spec: list of netem args, or None to clear."""
+        for dev, ns in ((self.HOST_IF, None), (self.NS_IF, self.NS)):
+            pre = ["ip", "netns", "exec", ns] if ns else []
+            if spec is None:
+                sh(*pre, "tc", "qdisc", "del", "dev", dev, "root", check=False)
+            else:
+                sh(*pre, "tc", "qdisc", "replace", "dev", dev, "root", "netem", *spec)
+
+    def down(self):
+        if self.fw:
+            sh(*(["iptables", "-D"] + self.fw[2:]), check=False)
+            self.fw = None
+        sh("ip", "netns", "del", self.NS, check=False)  # removes the veth pair with it
 
 
 class Base(__import__("unittest").TestCase):

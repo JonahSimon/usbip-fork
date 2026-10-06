@@ -1,5 +1,11 @@
 # usbip-fork
 
+**End goal (Jonah, 2026-10-06):** run [Nucleus Co-op](https://github.com/SplitScreen-Me/splitscreenme-nucleus) on the gaming PC to
+split-screen games to the living-room TV wirelessly (Sunshine/Moonlight to the Beelink), with the Beelink holding the
+controllers' receivers and passing them back to the PC so Nucleus sees each one as its own device. Everything below
+is groundwork for that: measure stock usbip, then build something better where it falls short.
+
+
 Notes and baseline tests for a possible usbip fork (VirtualHere replacement).
 `ref/` holds the kernel usbip sources and protocol doc we read (GPL, from torvalds/linux master).
 
@@ -38,10 +44,12 @@ Not emulable this way: real Xbox adapters (vendor class, not HID). Use the physi
 |---|---|
 | `test_10_protocol` | Raw USB/IP wire conformance: devlist, import, errors, bad version, truncated input, descriptors, pipelining, interrupt IN/OUT, unlink |
 | `test_20_functional` | Kernel client end to end: identity, descriptor fidelity, stream integrity, output reports, gamepad events |
+| `test_25_composite` | Multi-interface devices: puck shape (serial + 4 HID slots, 54-byte reports at 270 Hz), two pucks, dongle shape; slot isolation; serial flood beside HID |
 | `test_30_latency` | Native vs USB/IP loopback overhead, rate sweep 125 to 800 Hz |
 | `test_40_scale` | 1, 4, 8 devices (also 8 at 1000 Hz each), vhci port cap |
 | `test_50_resilience` | Unbind/detach races, server kill and restart, 100 attach/detach cycles, handshake fuzz, optional kernel URB fuzz |
 | `test_60_netem` | Delay, jitter, 1% loss, 10 Mbit cap, 8 devices at 20 ms. Server in its own netns, only the veth pair is shaped |
+| `test_70_rate` | Delivered report rate versus link delay (the 1/RTT cap) |
 
 **Same suite for the fork:** set `USBIPD_CMD` and `USBIP_CMD`. Tests marked `known_stock_bug` are expected failures on
 stock and strict on anything else, so the fork must pass them.
@@ -100,3 +108,29 @@ tests need real firmware. For usbip purposes only the shape matters: a vendor-cl
 Reference clones saved in `ref-xone/` (xone dongle.c, mt76.c, wired.c).
 Plan: puck-shaped composite via configfs now; vendor bulk multi-endpoint device for the dongle shape; real dongle and puck on the
 Beelink for the final check.
+
+### Rate cap found 2026-10-06 (`test_70_rate`, 1000 Hz source, netem delay each way)
+| one-way delay | RTT | delivered reports/s | 1/RTT |
+|---|---|---|---|
+| 0 | 0 | 1000 | n/a |
+| 1 ms | 2 ms | 463 | 500 |
+| 2 ms | 4 ms | 240 | 250 |
+| 5 ms | 10 ms | 98 | 100 |
+| 10 ms | 20 ms | 50 | 50 |
+
+Stock usbip keeps one interrupt URB in flight per endpoint, and a device report moves only when a URB is waiting at the
+server, so each endpoint delivers at most one report per round trip. Packet capture confirms the strict
+request, reply, request, reply cycle. Real controllers report at 125 to 270 Hz, so RTT above about 8 ms (Xbox) or 3.7 ms
+(puck) starts dropping updates, and p50 latency under saturation grows to several RTTs. Loopback tests cannot see this.
+Fixing it needs the client side to complete URBs from a local buffer, which the stock kernel client (`vhci_hcd`) does not do.
+Forwarding decoded controller state instead of USB traffic sidesteps the cap entirely.
+
+Harness artifact worth remembering: an emulated report that exactly fills the endpoint packet makes `f_hid` append a
+zero-length packet, and every other URB returns empty, halving the rate (first measurements were 2x too low until fixed).
+
+### Emulated devices (`lib.Gadget`)
+`probe`, `pad`, `loop`, `puck` (serial + HID slots, shaped like the Steam puck), `dongle` (two vendor bulk interfaces; no
+isochronous, dummy_hcd cannot provide it here). `f_hid` has 4 minors machine-wide, so HID slots across live gadgets total 4.
+Test network helper: `lib.Link` (server in a netns, veth pair, netem on that pair only).
+
+Stock bug list addendum: **8.** per-endpoint report rate capped at 1/RTT (above). Verified suite state 2026-10-06: 58 tests, all green on stock (3 expected failures that the fork must pass).
