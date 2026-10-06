@@ -4,6 +4,7 @@
 # Tuning: CYCLES, LAT_P50_MS, LAT_P99_MS, SCALE_P99_MS, EXPECT_SESSION_SURVIVES_SERVER_KILL, FUZZ_SEED, FUZZ_URB=1
 cd "$(dirname "$0")" || exit 1
 [ "$(id -u)" = 0 ] || exec sudo -E "$0" "$@"
+command -v cargo >/dev/null && (cd ../ufk && cargo build --release -q)   # the Rust prototype under test_80_ufk
 python3 lib.py   # clean slate: detach, unbind, remove leftover gadgets
 if [ $# -eq 0 ]; then python3 -m unittest discover -v -p 'test_*.py'; else python3 -m unittest -v "$@"; fi
 rc=$?

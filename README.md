@@ -134,3 +134,33 @@ isochronous, dummy_hcd cannot provide it here). `f_hid` has 4 minors machine-wid
 Test network helper: `lib.Link` (server in a netns, veth pair, netem on that pair only).
 
 Stock bug list addendum: **8.** per-endpoint report rate capped at 1/RTT (above). Verified suite state 2026-10-06: 58 tests, all green on stock (3 expected failures that the fork must pass).
+
+## Rust prototype `ufk/` and first real-network results (2026-10-06)
+`ufk serve` is a std-only USB/IP server that exports synthetic HID devices (busid `1-1`, `1-2`, ...), so the transport can be
+tested over a real network without hardware. `ufk attach HOST:PORT BUSID` is a Linux client that does the import and hands the
+socket to `vhci_hcd` (what `usbip attach` does), with fixes for stock problems: parallel attaches (retries the next free port),
+enumeration verification (kernel sometimes accepts a socket on a reused port and never enumerates; we detach and retry), and
+`TCP_NODELAY` on both ends. Wire format is stock USB/IP, so stock clients work against it. Builds for Windows too
+(`cargo build --release --target x86_64-pc-windows-gnu`, needs `mingw-w64-gcc`); the Windows build is server only for now.
+Latency policy: a stream report goes out the moment a URB is waiting, otherwise only the newest is kept (latest wins, nothing
+queues up and goes stale). Echo reports (host output report bounced back as an input report) give a true host-clock round trip.
+Real hardware (nusb) is not wired in yet. Tests: `tests/test_80_ufk.py` (protocol, fuzz, unlink wake, parallel attach, kernel
+client) and `tests/netprobe.py` (rate, gaps, echo RTT through hidraw).
+
+Windows server on the Beelink (WiFi 6, ping avg 2.8 ms) to this PC (wired, Linux kernel client), 20 s each, 125 Hz echo probe:
+
+| Source rate | Reports delivered | Gap p50 / p99 / max (ms) | Echo RTT p50 / p99 / max (ms) |
+|---|---|---|---|
+| 125 Hz | 2372 of 2500 (5% skipped) | 8.0 / 18.8 / **230.9** | 2.2 / 13.0 / 233.6 |
+| 270 Hz | 5071 of 5401 (6% skipped) | 3.7 / 12.7 / 21.6 | 2.3 / 10.7 / 16.0 |
+| 1000 Hz | 2796 of 20001 (**140/s**) | 6.6 / 23.5 / 43.8 | 5.6 / 14.5 / 22.2 |
+| 270 Hz, Nagle left on | stream starved | n/a | **11.4** / 27.8 / 100.6 |
+| 270 Hz, Linux server, loopback | 2160 of 2160 | 3.70 / 3.72 / 3.78 | 0.05 / 0.10 / 0.13 |
+
+Read: (1) The real-WiFi round trip matches ping (2.3 ms). Skipped reports are the latest-wins policy dropping stale
+updates when a URB turnaround spikes, and what arrives is fresh (server-side wait p99 3.3 ms). (2) The 1/RTT cap is real on this
+link: a 1000 Hz source delivers 140/s. (3) One 230 ms stall in 20 s at 125 Hz looks like a TCP retransmit (Windows min RTO is
+300 ms); not proven by capture. (4) Nagle costs 5x on echo RTT: `TCP_NODELAY` is mandatory. (5) The echo probe competes with the
+stream for URB turnarounds (echo goes first), so stream numbers are a bit pessimistic versus a real pad that rarely gets output reports.
+Single runs. Launch note for Windows over ssh: processes started in an ssh session die with it, start through WMI
+(`Invoke-CimMethod Win32_Process Create`) instead.
