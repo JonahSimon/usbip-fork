@@ -1,15 +1,17 @@
 //! ufk: prototype USB/IP server and Linux client, std only.
-//!   ufk serve  [--port 3241] [--hz 270] [--devices 1] [--stats 5] [--no-nodelay]
+//!   ufk serve  [--port 3241] [--hz 270] [--devices 1] [--stats 5] [--no-nodelay] [--gamepad]
 //!   ufk attach HOST:PORT BUSID          (Linux, root: hands the connected socket to vhci_hcd)
 //! The server exports synthetic HID devices (busid 1-1, 1-2, ...) so the transport can be tested over a real network
 //! without hardware. Wire format is the stock USB/IP protocol, so stock `usbip attach` works against it too.
 //! Input report (16 B): [0]=1 stream | 2 echo, [4..8]=seq, [8..16]=server ns (stream) or the 8 bytes the host wrote (echo).
+//! --gamepad: each device is also a standard HID gamepad shaped like an Xbox 360 pad (045e:028e, same evdev codes as
+//! xpad), report 32 B = the 16 B above + pad state; UDP port+1 takes pads.py lines "N BTN_SOUTH [hold_s]" / "N ABS_X v".
 //! Latency policy: a stream report is delivered the moment a URB is waiting, otherwise only the NEWEST is kept
 //! (latest wins, nothing queues up and goes stale). Echo reports are never dropped and go first.
 use std::collections::VecDeque;
 use std::io::{self, Read, Write};
-use std::net::{TcpListener, TcpStream};
-use std::sync::{Arc, Mutex};
+use std::net::{TcpListener, TcpStream, UdpSocket};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 const VER: u16 = 0x0111;
@@ -24,14 +26,46 @@ const REPORT_DESC: &[u8] = &[
     0x02, 0x09, 0x03, 0x95, 0x08, 0x91, 0x02, 0xC0,
 ];
 
+static GAMEPAD: OnceLock<bool> = OnceLock::new();
+fn gp() -> bool {
+    *GAMEPAD.get().unwrap_or(&false)
+}
+fn rl() -> usize {
+    if gp() { 32 } else { 16 }
+}
+fn vid_pid() -> (u16, u16) {
+    if gp() { (0x045e, 0x028e) } else { (VID, PID) }
+}
+
+// bytes 0..16 vendor (seq/timestamps, no input events), 16..18 buttons in xpad's order (HID buttons 1,2,4,5,7,8,11..15
+// map to BTN_SOUTH, EAST, NORTH, WEST, TL, TR, SELECT, START, MODE, THUMBL, THUMBR), 18 hat, 20..28 X Y RX RY, 28 Z, 29 RZ
+const GP_DESC: &[u8] = &[
+    0x05, 0x01, 0x09, 0x05, 0xA1, 0x01,
+    0x06, 0x00, 0xFF, 0x09, 0x01, 0x15, 0x00, 0x26, 0xFF, 0x00, 0x75, 0x08, 0x95, 0x10, 0x81, 0x02,
+    0x05, 0x09, 0x09, 0x01, 0x09, 0x02, 0x09, 0x04, 0x09, 0x05, 0x09, 0x07, 0x09, 0x08, 0x09, 0x0B, 0x09, 0x0C, 0x09, 0x0D,
+    0x09, 0x0E, 0x09, 0x0F, 0x15, 0x00, 0x25, 0x01, 0x75, 0x01, 0x95, 0x0B, 0x81, 0x02,
+    0x75, 0x01, 0x95, 0x05, 0x81, 0x03,
+    0x05, 0x01, 0x09, 0x39, 0x15, 0x00, 0x25, 0x07, 0x75, 0x04, 0x95, 0x01, 0x81, 0x42,
+    0x75, 0x04, 0x95, 0x01, 0x81, 0x03, 0x75, 0x08, 0x95, 0x01, 0x81, 0x03,
+    0x09, 0x30, 0x09, 0x31, 0x09, 0x33, 0x09, 0x34, 0x16, 0x00, 0x80, 0x26, 0xFF, 0x7F, 0x75, 0x10, 0x95, 0x04, 0x81, 0x02,
+    0x09, 0x32, 0x09, 0x35, 0x15, 0x00, 0x26, 0xFF, 0x00, 0x75, 0x08, 0x95, 0x02, 0x81, 0x02,
+    0x75, 0x08, 0x95, 0x02, 0x81, 0x03,
+    0x06, 0x00, 0xFF, 0x09, 0x03, 0x15, 0x00, 0x26, 0xFF, 0x00, 0x75, 0x08, 0x95, 0x08, 0x91, 0x02,
+    0xC0,
+];
+fn report_desc() -> &'static [u8] {
+    if gp() { GP_DESC } else { REPORT_DESC }
+}
+
 fn device_desc() -> Vec<u8> {
-    vec![18, 1, 0, 2, 0, 0, 0, 64, VID as u8, (VID >> 8) as u8, PID as u8, (PID >> 8) as u8, 0, 1, 1, 2, 3, 1]
+    let (v, p) = vid_pid();
+    vec![18, 1, 0, 2, 0, 0, 0, 64, v as u8, (v >> 8) as u8, p as u8, (p >> 8) as u8, 0, 1, 1, 2, 3, 1]
 }
 
 fn config_desc() -> Vec<u8> {
     let mut d = vec![9, 2, 41, 0, 1, 1, 0, 0x80, 50];
     d.extend([9, 4, 0, 0, 2, 3, 0, 0, 0]);
-    d.extend([9, 0x21, 0x11, 0x01, 0, 1, 0x22, REPORT_DESC.len() as u8, 0]);
+    d.extend([9, 0x21, 0x11, 0x01, 0, 1, 0x22, report_desc().len() as u8, 0]);
     d.extend([7, 5, 0x81, 3, 64, 0, 4]);
     d.extend([7, 5, 0x02, 3, 64, 0, 4]);
     d
@@ -91,8 +125,8 @@ fn dev_record(idx: u32, with_ifaces: bool) -> Vec<u8> {
     for v in [1u32, idx, 3] {
         b.extend(v.to_be_bytes()); // busnum, devnum, speed (3 = high)
     }
-    b.extend(VID.to_be_bytes());
-    b.extend(PID.to_be_bytes());
+    b.extend(vid_pid().0.to_be_bytes());
+    b.extend(vid_pid().1.to_be_bytes());
     b.extend(0x0100u16.to_be_bytes());
     b.extend([0, 0, 0, 1, 1, 1]); // class, subclass, protocol, cfg value, num configs, num interfaces
     if with_ifaces {
@@ -120,8 +154,8 @@ struct Stats {
 struct St {
     conn: Option<Arc<Conn>>,
     pending: VecDeque<u32>,
-    latest: Option<(Instant, [u8; 16])>,
-    echo: VecDeque<[u8; 16]>,
+    latest: Option<(Instant, [u8; 32])>,
+    echo: VecDeque<[u8; 32]>,
     seq: u32,
     echo_seq: u32,
     stats: Stats,
@@ -130,16 +164,58 @@ struct St {
 struct Dev {
     idx: u32,
     st: Mutex<St>,
+    pad: Mutex<[u8; 16]>, // report bytes 16..32 (--gamepad); [14],[15] hold the hat x/y the hat byte is built from
 }
 
-fn send_in(conn: &Conn, seq: u32, r: &[u8; 16]) {
-    conn.send(&ret_submit(seq, 0, 16, r));
+const PAD_IDLE: [u8; 16] = [0, 0, 8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+
+// one pads.py line: "N BTN_x [hold_s]" (press, hold, release) or "N ABS_x value"; blocks for presses, like pads.py
+fn pad_cmd(devs: &[Arc<Dev>], line: &str) {
+    const BTN: [&str; 11] = ["BTN_SOUTH", "BTN_EAST", "BTN_NORTH", "BTN_WEST", "BTN_TL", "BTN_TR", "BTN_SELECT", "BTN_START", "BTN_MODE", "BTN_THUMBL", "BTN_THUMBR"];
+    let t: Vec<&str> = line.split_whitespace().collect();
+    let Some(d) = t.first().and_then(|n| n.parse::<u32>().ok()).and_then(|n| devs.iter().find(|d| d.idx == n)) else { return };
+    let Some(&name) = t.get(1) else { return };
+    let v: f64 = t.get(2).and_then(|v| v.parse().ok()).unwrap_or(f64::NAN);
+    if let Some(b) = BTN.iter().position(|&x| x == name) {
+        let set = |on: bool| {
+            let mut p = d.pad.lock().unwrap();
+            let m = u16::from_le_bytes([p[0], p[1]]);
+            p[..2].copy_from_slice(&(if on { m | 1 << b } else { m & !(1 << b) }).to_le_bytes());
+        };
+        set(true);
+        std::thread::sleep(Duration::from_secs_f64(if v.is_nan() { 0.12 } else { v }));
+        set(false);
+        std::thread::sleep(Duration::from_millis(100));
+        return;
+    }
+    let mut p = d.pad.lock().unwrap();
+    let v = if v.is_nan() { 0 } else { v as i64 };
+    let mut put16 = |o: usize| p[o..o + 2].copy_from_slice(&(v.clamp(-32768, 32767) as i16).to_le_bytes());
+    match name {
+        "ABS_X" => put16(4),
+        "ABS_Y" => put16(6),
+        "ABS_RX" => put16(8),
+        "ABS_RY" => put16(10),
+        "ABS_Z" => p[12] = v.clamp(0, 255) as u8,
+        "ABS_RZ" => p[13] = v.clamp(0, 255) as u8,
+        "ABS_HAT0X" | "ABS_HAT0Y" => {
+            p[if name == "ABS_HAT0X" { 14 } else { 15 }] = v.clamp(-1, 1) as i8 as u8;
+            p[2] = match (p[14] as i8, p[15] as i8) {
+                (0, -1) => 0, (1, -1) => 1, (1, 0) => 2, (1, 1) => 3, (0, 1) => 4, (-1, 1) => 5, (-1, 0) => 6, (-1, -1) => 7, _ => 8,
+            };
+        }
+        _ => {}
+    }
+}
+
+fn send_in(conn: &Conn, seq: u32, r: &[u8; 32]) {
+    conn.send(&ret_submit(seq, 0, rl() as i32, &r[..rl()]));
 }
 
 fn push_echo(st: &mut St, out: &[u8]) {
     let Some(conn) = st.conn.clone() else { return };
     st.echo_seq = st.echo_seq.wrapping_add(1);
-    let mut r = [0u8; 16];
+    let mut r = [0u8; 32];
     r[0] = 2;
     r[4..8].copy_from_slice(&st.echo_seq.to_le_bytes());
     let n = out.len().min(8);
@@ -175,10 +251,11 @@ fn generator(devs: Arc<Vec<Arc<Dev>>>, hz: f64) {
             let mut st = d.st.lock().unwrap();
             let Some(conn) = st.conn.clone() else { continue };
             st.seq = st.seq.wrapping_add(1);
-            let mut r = [0u8; 16];
+            let mut r = [0u8; 32];
             r[0] = 1;
             r[4..8].copy_from_slice(&st.seq.to_le_bytes());
             r[8..16].copy_from_slice(&(t0.elapsed().as_nanos() as u64).to_le_bytes());
+            r[16..32].copy_from_slice(&*d.pad.lock().unwrap());
             if let Some(seq) = st.pending.pop_front() {
                 send_in(&conn, seq, &r);
                 st.stats.delivered += 1;
@@ -225,7 +302,7 @@ fn control(dev: &Dev, s: &[u8; 8], out: &[u8]) -> (i32, Vec<u8>) {
             _ => stall,
         },
         (0x81, 6) => match val >> 8 {
-            0x22 => ok(REPORT_DESC.to_vec()),
+            0x22 => ok(report_desc().to_vec()),
             0x21 => ok(config_desc()[18..27].to_vec()),
             _ => stall,
         },
@@ -236,7 +313,7 @@ fn control(dev: &Dev, s: &[u8; 8], out: &[u8]) -> (i32, Vec<u8>) {
             push_echo(&mut dev.st.lock().unwrap(), out);
             ok(vec![])
         }
-        (0xa1, 0x01) => ok(dev.st.lock().unwrap().latest.map_or(vec![0; 16], |(_, r)| r.to_vec())),
+        (0xa1, 0x01) => ok(dev.st.lock().unwrap().latest.map_or(vec![0; rl()], |(_, r)| r[..rl()].to_vec())),
         _ => stall,
     }
 }
@@ -361,9 +438,22 @@ fn opt<T: std::str::FromStr>(a: &[String], name: &str, default: T) -> T {
 fn serve(a: &[String]) {
     let (port, hz, n, stats): (u16, f64, u32, u64) = (opt(a, "--port", 3241), opt(a, "--hz", 270.0), opt(a, "--devices", 1), opt(a, "--stats", 5));
     let nodelay = !a.iter().any(|x| x == "--no-nodelay");
-    let devs: Arc<Vec<Arc<Dev>>> = Arc::new((1..=n).map(|idx| Arc::new(Dev { idx, st: Mutex::new(St::default()) })).collect());
+    let _ = GAMEPAD.set(a.iter().any(|x| x == "--gamepad"));
+    let devs: Arc<Vec<Arc<Dev>>> = Arc::new((1..=n).map(|idx| Arc::new(Dev { idx, st: Mutex::new(St::default()), pad: Mutex::new(PAD_IDLE) })).collect());
+    if gp() {
+        let u = UdpSocket::bind(("0.0.0.0", port + 1)).expect("bind udp");
+        let d = devs.clone();
+        std::thread::spawn(move || {
+            let mut b = [0u8; 1500];
+            while let Ok(n) = u.recv(&mut b) {
+                for line in String::from_utf8_lossy(&b[..n]).lines() {
+                    pad_cmd(&d, line);
+                }
+            }
+        });
+    }
     let l = TcpListener::bind(("0.0.0.0", port)).expect("bind");
-    println!("[ufk] serving {n} demo device(s) at {hz} Hz on port {port}, nodelay={nodelay}");
+    println!("[ufk] serving {n} demo device(s) at {hz} Hz on port {port}, nodelay={nodelay}, gamepad={}", gp());
     let _ = io::stdout().flush();
     let (g, s) = (devs.clone(), devs.clone());
     std::thread::spawn(move || generator(g, hz));
@@ -470,7 +560,7 @@ fn main() {
             }
         }
         _ => {
-            eprintln!("usage: ufk serve [--port N] [--hz N] [--devices N] [--stats SECS] [--no-nodelay]\n       ufk attach HOST:PORT BUSID");
+            eprintln!("usage: ufk serve [--port N] [--hz N] [--devices N] [--stats SECS] [--no-nodelay] [--gamepad]\n       ufk attach HOST:PORT BUSID");
             std::process::exit(2);
         }
     }
