@@ -164,3 +164,7 @@ link: a 1000 Hz source delivers 140/s. (3) One 230 ms stall in 20 s at 125 Hz lo
 stream for URB turnarounds (echo goes first), so stream numbers are a bit pessimistic versus a real pad that rarely gets output reports.
 Single runs. Launch note for Windows over ssh: processes started in an ssh session die with it, start through WMI
 (`Invoke-CimMethod Win32_Process Create`) instead.
+
+## License
+
+GPL-2.0-only, see `LICENSE`. Same as the Linux kernel usbip code this follows.
